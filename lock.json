@@ -27,7 +27,7 @@
             ]
         },
         {
-            "name": "github.com/Sirupsen/logrus",
+            "name": "github.com/sirupsen/logrus",
             "branch": "master",
             "revision": "7f4b1adc791766938c29457bed0703fb9134421a",
             "packages": [

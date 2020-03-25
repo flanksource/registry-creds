@@ -1,6 +1,6 @@
 {
     "dependencies": {
-        "github.com/Sirupsen/logrus": {
+        "github.com/sirupsen/logrus": {
             "branch": "master"
         },
         "github.com/aws/aws-sdk-go": {
