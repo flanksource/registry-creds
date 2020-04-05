@@ -25,7 +25,6 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -33,38 +32,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/flanksource/registry-creds/providers"
+
+	"github.com/flanksource/registry-creds/config"
+
 	"github.com/Sirupsen/logrus"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ecr"
 	"github.com/cenkalti/backoff"
+	"github.com/flanksource/registry-creds/k8sutil"
 	flag "github.com/spf13/pflag"
-	"github.com/upmc-enterprises/registry-creds/k8sutil"
-	"golang.org/x/net/context"
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
 	v1 "k8s.io/client-go/pkg/api/v1"
-)
-
-const (
-	// Retry Types
-	retryTypeSimple      = "simple"
-	retryTypeExponential = "exponential"
-
-	dockerCfgTemplate                = `{"%s":{"username":"oauth2accesstoken","password":"%s","email":"none"}}`
-	dockerPrivateRegistryPasswordKey = "DOCKER_PRIVATE_REGISTRY_PASSWORD"
-	dockerPrivateRegistryServerKey   = "DOCKER_PRIVATE_REGISTRY_SERVER"
-	dockerPrivateRegistryUserKey     = "DOCKER_PRIVATE_REGISTRY_USER"
-	acrURLKey                        = "ACR_URL"
-	acrClientIDKey                   = "ACR_CLIENT_ID"
-	acrPasswordKey                   = "ACR_PASSWORD"
-	tokenGenRetryTypeKey             = "TOKEN_RETRY_TYPE"
-	tokenGenRetriesKey               = "TOKEN_RETRIES"
-	tokenGenRetryDelayKey            = "TOKEN_RETRY_DELAY"
-	defaultTokenGenRetries           = 3
-	defaultTokenGenRetryDelay        = 5 // in seconds
-	defaultTokenGenRetryType         = retryTypeSimple
 )
 
 var (
@@ -86,9 +62,9 @@ var (
 	argRefreshMinutes        = flags.Int("refresh-mins", 60, `Default time to wait before refreshing (60 minutes)`)
 	argSkipKubeSystem        = flags.Bool("skip-kube-system", true, `If true, will not attempt to set ImagePullSecrets on the kube-system namespace`)
 	argAWSAssumeRole         = flags.String("aws_assume_role", "", `If specified AWS will assume this role and use it to retrieve tokens`)
-	argTokenGenFxnRetryType  = flags.String("token-retry-type", defaultTokenGenRetryType, `The type of retry timer to use when generating a secret token; either simple or exponential (simple)`)
-	argTokenGenFxnRetries    = flags.Int("token-retries", defaultTokenGenRetries, `Default number of times to retry generating a secret token (3)`)
-	argTokenGenFxnRetryDelay = flags.Int("token-retry-delay", defaultTokenGenRetryDelay, `Default number of seconds to wait before retrying secret token generation (5 seconds)`)
+	argTokenGenFxnRetryType  = flags.String("token-retry-type", config.DefaultTokenGenRetryType, `The type of retry timer to use when generating a secret token; either simple or exponential (simple)`)
+	argTokenGenFxnRetries    = flags.Int("token-retries", config.DefaultTokenGenRetries, `Default number of times to retry generating a secret token (3)`)
+	argTokenGenFxnRetryDelay = flags.Int("token-retry-delay", config.DefaultTokenGenRetryDelay, `Default number of seconds to wait before retrying secret token generation (5 seconds)`)
 )
 
 var (
@@ -112,11 +88,8 @@ type registryAuth struct {
 }
 
 type controller struct {
-	k8sutil   *k8sutil.K8sutilInterface
-	ecrClient ecrInterface
-	gcrClient gcrInterface
-	dprClient dprInterface
-	acrClient acrInterface
+	k8sutil                *k8sutil.K8sutilInterface
+	secretGeneratorBuilder SecretGeneratorBuilder
 }
 
 // RetryConfig represents the number of retries + the retry delay for retrying an operation if it should fail
@@ -126,133 +99,7 @@ type RetryConfig struct {
 	RetryDelayInSeconds int
 }
 
-// Docker Private Registry interface
-type dprInterface interface {
-	getAuthToken(server, user, password string) (AuthToken, error)
-}
-
-type ecrInterface interface {
-	GetAuthorizationToken(input *ecr.GetAuthorizationTokenInput) (*ecr.GetAuthorizationTokenOutput, error)
-}
-
-type gcrInterface interface {
-	DefaultTokenSource(ctx context.Context, scope ...string) (oauth2.TokenSource, error)
-}
-
-type acrInterface interface {
-	getAuthToken(registryURL, clientID, password string) (AuthToken, error)
-}
-
-func newEcrClient() ecrInterface {
-	sess := session.Must(session.NewSession())
-	awsConfig := aws.NewConfig().WithRegion(*argAWSRegion)
-
-	if *argAWSAssumeRole != "" {
-		creds := stscreds.NewCredentials(sess, *argAWSAssumeRole)
-		awsConfig.Credentials = creds
-	}
-
-	return ecr.New(sess, awsConfig)
-}
-
-type dprClient struct{}
-
-func (dpr dprClient) getAuthToken(server, user, password string) (AuthToken, error) {
-	if server == "" {
-		return AuthToken{}, fmt.Errorf(fmt.Sprintf("Failed to get auth token for docker private registry: empty value for %s", dockerPrivateRegistryServerKey))
-	}
-
-	if user == "" {
-		return AuthToken{}, fmt.Errorf(fmt.Sprintf("Failed to get auth token for docker private registry: empty value for %s", dockerPrivateRegistryUserKey))
-	}
-
-	if password == "" {
-		return AuthToken{}, fmt.Errorf(fmt.Sprintf("Failed to get auth token for docker private registry: empty value for %s", dockerPrivateRegistryPasswordKey))
-	}
-
-	token := base64.StdEncoding.EncodeToString([]byte(strings.Join([]string{user, password}, ":")))
-
-	return AuthToken{AccessToken: token, Endpoint: server}, nil
-}
-
-func newDprClient() dprInterface {
-	return dprClient{}
-}
-
-type gcrClient struct{}
-
-func (gcr gcrClient) DefaultTokenSource(ctx context.Context, scope ...string) (oauth2.TokenSource, error) {
-	return google.DefaultTokenSource(ctx, scope...)
-}
-
-func newGcrClient() gcrInterface {
-	return gcrClient{}
-}
-
-func (c *controller) getDPRToken() ([]AuthToken, error) {
-	token, err := c.dprClient.getAuthToken(*argDPRServer, *argDPRUser, *argDPRPassword)
-	return []AuthToken{token}, err
-}
-
-func (c *controller) getGCRAuthorizationKey() ([]AuthToken, error) {
-	ts, err := c.gcrClient.DefaultTokenSource(context.TODO(), "https://www.googleapis.com/auth/cloud-platform")
-	if err != nil {
-		return []AuthToken{}, err
-	}
-
-	token, err := ts.Token()
-	if err != nil {
-		return []AuthToken{}, err
-	}
-
-	if !token.Valid() {
-		return []AuthToken{}, fmt.Errorf("token was invalid")
-	}
-
-	if token.Type() != "Bearer" {
-		return []AuthToken{}, fmt.Errorf(fmt.Sprintf("expected token type \"Bearer\" but got \"%s\"", token.Type()))
-	}
-
-	tokens := make([]AuthToken, 0)
-	tokens = append(tokens, AuthToken{token.AccessToken, *argGCRURL})
-
-	return tokens, nil
-}
-
-func (c *controller) getECRAuthorizationKey() ([]AuthToken, error) {
-
-	var tokens []AuthToken
-	var regIds []*string
-	regIds = make([]*string, len(awsAccountIDs))
-
-	for i, awsAccountID := range awsAccountIDs {
-		regIds[i] = aws.String(awsAccountID)
-	}
-
-	params := &ecr.GetAuthorizationTokenInput{
-		RegistryIds: regIds,
-	}
-
-	resp, err := c.ecrClient.GetAuthorizationToken(params)
-
-	if err != nil {
-		// Print the error, cast err to awserr.Error to get the Code and
-		// Message from an error.
-		logrus.Println(err.Error())
-		return []AuthToken{}, err
-	}
-
-	for _, auth := range resp.AuthorizationData {
-		tokens = append(tokens, AuthToken{
-			AccessToken: *auth.AuthorizationToken,
-			Endpoint:    *auth.ProxyEndpoint,
-		})
-
-	}
-	return tokens, nil
-}
-
-func generateSecretObj(tokens []AuthToken, isJSONCfg bool, secretName string) (*v1.Secret, error) {
+func generateSecretObj(tokens []providers.AuthToken, isJSONCfg bool, secretName string) (*v1.Secret, error) {
 	secret := &v1.Secret{
 		ObjectMeta: v1.ObjectMeta{
 			Name: secretName,
@@ -275,81 +122,72 @@ func generateSecretObj(tokens []AuthToken, isJSONCfg bool, secretName string) (*
 	} else {
 		if len(tokens) == 1 {
 			secret.Data = map[string][]byte{
-				".dockercfg": []byte(fmt.Sprintf(dockerCfgTemplate, tokens[0].Endpoint, tokens[0].AccessToken))}
+				".dockercfg": []byte(fmt.Sprintf(config.DockerCfgTemplate, tokens[0].Endpoint, tokens[0].AccessToken))}
 			secret.Type = "kubernetes.io/dockercfg"
 		}
 	}
 	return secret, nil
 }
 
-type acrClient struct{}
-
-func (c acrClient) getAuthToken(registryURL, clientID, password string) (AuthToken, error) {
-	if registryURL == "" {
-		return AuthToken{}, fmt.Errorf("Azure Container Registry URL is missing; ensure %s parameter is set", acrURLKey)
-	}
-
-	if clientID == "" {
-		return AuthToken{}, fmt.Errorf("Client ID needed to access Azure Container Registry is missing; ensure %s parameter is set", acrClientIDKey)
-	}
-
-	if password == "" {
-		return AuthToken{}, fmt.Errorf("Password needed to access Azure Container Registry is missing; ensure %s paremeter is set", acrClientIDKey)
-	}
-
-	token := base64.StdEncoding.EncodeToString([]byte(strings.Join([]string{clientID, password}, ":")))
-
-	return AuthToken{AccessToken: token, Endpoint: registryURL}, nil
-}
-
-func (c *controller) getACRToken() ([]AuthToken, error) {
-	token, err := c.acrClient.getAuthToken(*argACRURL, *argACRClientID, *argACRPassword)
-	return []AuthToken{token}, err
-}
-
-func newACRClient() acrInterface {
-	return acrClient{}
-}
-
-// AuthToken represents an Access Token and an Endpoint for a registry service
-type AuthToken struct {
-	AccessToken string
-	Endpoint    string
-}
-
 // SecretGenerator represents a token generation function for a registry service
 type SecretGenerator struct {
-	TokenGenFxn func() ([]AuthToken, error)
-	IsJSONCfg   bool
-	SecretName  string
+	Name       string
+	Provider   providers.Provider
+	IsJSONCfg  bool
+	SecretName string
 }
 
-func getSecretGenerators(c *controller) []SecretGenerator {
-	secretGenerators := make([]SecretGenerator, 0)
+type SecretGeneratorBuilder func() []SecretGenerator
 
-	secretGenerators = append(secretGenerators, SecretGenerator{
-		TokenGenFxn: c.getGCRAuthorizationKey,
-		IsJSONCfg:   false,
-		SecretName:  *argGCRSecretName,
-	})
+func getSecretGenerators() []SecretGenerator {
+	availableSecretGenerators := []SecretGenerator{
+		{
+			Name:       "gcr",
+			Provider:   providers.NewGCR(*argGCRURL),
+			IsJSONCfg:  false,
+			SecretName: *argGCRSecretName,
+		},
+		{
+			Name: "ecr",
+			Provider: providers.NewECR(providers.ECRConfig{
+				AwsAccountIds: awsAccountIDs,
+				AWSAssumeRole: argAWSAssumeRole,
+				AwsRegion:     *argAWSRegion,
+			}),
+			IsJSONCfg:  true,
+			SecretName: *argAWSSecretName,
+		},
+		{
+			Name: "dpr",
+			Provider: providers.NewDPR(providers.DPRConfig{
+				User:     *argDPRUser,
+				Password: *argDPRPassword,
+				Server:   *argDPRServer,
+			}),
+			IsJSONCfg:  true,
+			SecretName: *argDPRSecretName,
+		},
+		{
+			Name: "apr",
+			Provider: providers.NewACR(providers.ACRConfig{
+				RegistryURL: *argACRURL,
+				ClientID:    *argACRClientID,
+				Password:    *argACRPassword,
+			}),
+			IsJSONCfg:  true,
+			SecretName: *argACRSecretName,
+		},
+	}
 
-	secretGenerators = append(secretGenerators, SecretGenerator{
-		TokenGenFxn: c.getECRAuthorizationKey,
-		IsJSONCfg:   true,
-		SecretName:  *argAWSSecretName,
-	})
+	secretGenerators := []SecretGenerator{}
 
-	secretGenerators = append(secretGenerators, SecretGenerator{
-		TokenGenFxn: c.getDPRToken,
-		IsJSONCfg:   true,
-		SecretName:  *argDPRSecretName,
-	})
-
-	secretGenerators = append(secretGenerators, SecretGenerator{
-		TokenGenFxn: c.getACRToken,
-		IsJSONCfg:   true,
-		SecretName:  *argACRSecretName,
-	})
+	for _, s := range availableSecretGenerators {
+		if s.Provider.Enabled() {
+			secretGenerators = append(secretGenerators, s)
+		} else {
+			logrus.Errorf("Provider %s not enabled", s.Name)
+		}
+	}
 
 	return secretGenerators
 }
@@ -412,19 +250,19 @@ func (c *controller) processNamespace(namespace *v1.Namespace, secret *v1.Secret
 
 func (c *controller) generateSecrets() []*v1.Secret {
 	var secrets []*v1.Secret
-	secretGenerators := getSecretGenerators(c)
+	secretGenerators := c.secretGeneratorBuilder()
 
 	maxTries := RetryCfg.NumberOfRetries + 1
 	for _, secretGenerator := range secretGenerators {
 		resetRetryTimer()
 		logrus.Infof("------------------ [%s] ------------------\n", secretGenerator.SecretName)
 
-		var newTokens []AuthToken
+		var newTokens []providers.AuthToken
 		tries := 0
 		for {
 			tries++
 			logrus.Infof("Getting secret; try #%d of %d", tries, maxTries)
-			tokens, err := secretGenerator.TokenGenFxn()
+			tokens, err := secretGenerator.Provider.GetAuthToken()
 			if err != nil {
 				if tries < maxTries {
 					delayDuration := nextRetryDuration()
@@ -459,10 +297,10 @@ func (c *controller) generateSecrets() []*v1.Secret {
 func SetupRetryTimer() {
 	delayDuration := time.Duration(RetryCfg.RetryDelayInSeconds) * time.Second
 	switch RetryCfg.Type {
-	case retryTypeSimple:
+	case config.RetryTypeSimple:
 		simpleBackoff = backoff.NewConstantBackOff(delayDuration)
 		break
-	case retryTypeExponential:
+	case config.RetryTypeExponential:
 		exponentialBackoff = backoff.NewExponentialBackOff()
 		break
 	}
@@ -470,10 +308,10 @@ func SetupRetryTimer() {
 
 func resetRetryTimer() {
 	switch RetryCfg.Type {
-	case retryTypeSimple:
+	case config.RetryTypeSimple:
 		simpleBackoff.Reset()
 		break
-	case retryTypeExponential:
+	case config.RetryTypeExponential:
 		exponentialBackoff.Reset()
 		break
 	}
@@ -481,12 +319,12 @@ func resetRetryTimer() {
 
 func nextRetryDuration() time.Duration {
 	switch RetryCfg.Type {
-	case retryTypeSimple:
+	case config.RetryTypeSimple:
 		return simpleBackoff.NextBackOff()
-	case retryTypeExponential:
+	case config.RetryTypeExponential:
 		return exponentialBackoff.NextBackOff()
 	default:
-		return time.Duration(defaultTokenGenRetryDelay) * time.Second
+		return time.Duration(config.DefaultTokenGenRetryDelay) * time.Second
 	}
 }
 
@@ -495,12 +333,12 @@ func validateParams() {
 	awsAccountIDEnv := os.Getenv("awsaccount")
 	awsRegionEnv := os.Getenv("awsregion")
 	argAWSAssumeRoleEnv := os.Getenv("aws_assume_role")
-	dprPassword := os.Getenv(dockerPrivateRegistryPasswordKey)
-	dprServer := os.Getenv(dockerPrivateRegistryServerKey)
-	dprUser := os.Getenv(dockerPrivateRegistryUserKey)
-	acrURL := os.Getenv(acrURLKey)
-	acrClientID := os.Getenv(acrClientIDKey)
-	acrPassword := os.Getenv(acrPasswordKey)
+	dprPassword := os.Getenv(config.DockerPrivateRegistryPasswordKey)
+	dprServer := os.Getenv(config.DockerPrivateRegistryServerKey)
+	dprUser := os.Getenv(config.DockerPrivateRegistryUserKey)
+	acrURL := os.Getenv(config.AcrURLKey)
+	acrClientID := os.Getenv(config.AcrClientIDKey)
+	acrPassword := os.Getenv(config.AcrPasswordKey)
 	gcrURLEnv := os.Getenv("gcrurl")
 
 	// initialize the retry configuration using command line values
@@ -510,51 +348,51 @@ func validateParams() {
 		RetryDelayInSeconds: *argTokenGenFxnRetryDelay,
 	}
 	// ensure command line values are valid
-	if RetryCfg.Type != retryTypeSimple && RetryCfg.Type != retryTypeExponential {
-		logrus.Errorf("Unknown Retry Timer type '%s'! Defaulting to %s", RetryCfg.Type, defaultTokenGenRetryType)
-		RetryCfg.Type = defaultTokenGenRetryType
+	if RetryCfg.Type != config.RetryTypeSimple && RetryCfg.Type != config.RetryTypeExponential {
+		logrus.Errorf("Unknown Retry Timer type '%s'! Defaulting to %s", RetryCfg.Type, config.DefaultTokenGenRetryType)
+		RetryCfg.Type = config.DefaultTokenGenRetryType
 	}
 	if RetryCfg.NumberOfRetries < 0 {
-		logrus.Errorf("Cannot use a negative value for the number of retries! Defaulting to %d", defaultTokenGenRetries)
-		RetryCfg.NumberOfRetries = defaultTokenGenRetries
+		logrus.Errorf("Cannot use a negative value for the number of retries! Defaulting to %d", config.DefaultTokenGenRetries)
+		RetryCfg.NumberOfRetries = config.DefaultTokenGenRetries
 	}
 	if RetryCfg.RetryDelayInSeconds < 0 {
-		logrus.Errorf("Cannot use a negative value for the retry delay in seconds! Defaulting to %d", defaultTokenGenRetryDelay)
-		RetryCfg.RetryDelayInSeconds = defaultTokenGenRetryDelay
+		logrus.Errorf("Cannot use a negative value for the retry delay in seconds! Defaulting to %d", config.DefaultTokenGenRetryDelay)
+		RetryCfg.RetryDelayInSeconds = config.DefaultTokenGenRetryDelay
 	}
 	// look for overrides in environment variables and use them if they exist and are valid
-	tokenType, ok := os.LookupEnv(tokenGenRetryTypeKey)
+	tokenType, ok := os.LookupEnv(config.TokenGenRetryTypeKey)
 	if ok && len(tokenType) > 0 {
-		if tokenType != retryTypeSimple && tokenType != retryTypeExponential {
-			logrus.Errorf("Unknown Retry Timer type '%s'! Defaulting to %s", tokenType, defaultTokenGenRetryType)
-			RetryCfg.Type = defaultTokenGenRetryType
+		if tokenType != config.RetryTypeSimple && tokenType != config.RetryTypeExponential {
+			logrus.Errorf("Unknown Retry Timer type '%s'! Defaulting to %s", tokenType, config.DefaultTokenGenRetryType)
+			RetryCfg.Type = config.DefaultTokenGenRetryType
 		} else {
 			RetryCfg.Type = tokenType
 		}
 	}
-	tokenRetries, ok := os.LookupEnv(tokenGenRetriesKey)
+	tokenRetries, ok := os.LookupEnv(config.TokenGenRetriesKey)
 	if ok && len(tokenRetries) > 0 {
 		tokenRetriesInt, err := strconv.Atoi(tokenRetries)
 		if err != nil {
-			logrus.Errorf("Unable to parse value of environment variable %s! [Err: %s]", tokenGenRetriesKey, err)
+			logrus.Errorf("Unable to parse value of environment variable %s! [Err: %s]", config.TokenGenRetriesKey, err)
 		} else {
 			if tokenRetriesInt < 0 {
-				logrus.Errorf("Cannot use a negative value for environment variable %s! Defaulting to %d", tokenGenRetriesKey, defaultTokenGenRetries)
-				RetryCfg.NumberOfRetries = defaultTokenGenRetries
+				logrus.Errorf("Cannot use a negative value for environment variable %s! Defaulting to %d", config.TokenGenRetriesKey, config.DefaultTokenGenRetries)
+				RetryCfg.NumberOfRetries = config.DefaultTokenGenRetries
 			} else {
 				RetryCfg.NumberOfRetries = tokenRetriesInt
 			}
 		}
 	}
-	tokenRetryDelay, ok := os.LookupEnv(tokenGenRetryDelayKey)
+	tokenRetryDelay, ok := os.LookupEnv(config.TokenGenRetryDelayKey)
 	if ok && len(tokenRetryDelay) > 0 {
 		tokenRetryDelayInt, err := strconv.Atoi(tokenRetryDelay)
 		if err != nil {
-			logrus.Errorf("Unable to parse value of environment variable %s! [Err: %s]", tokenGenRetryDelayKey, err)
+			logrus.Errorf("Unable to parse value of environment variable %s! [Err: %s]", config.TokenGenRetryDelayKey, err)
 		} else {
 			if tokenRetryDelayInt < 0 {
-				logrus.Errorf("Cannot use a negative value for environment variable %s! Defaulting to %d", tokenGenRetryDelayKey, defaultTokenGenRetryDelay)
-				RetryCfg.RetryDelayInSeconds = defaultTokenGenRetryDelay
+				logrus.Errorf("Cannot use a negative value for environment variable %s! Defaulting to %d", config.TokenGenRetryDelayKey, config.DefaultTokenGenRetryDelay)
+				RetryCfg.RetryDelayInSeconds = config.DefaultTokenGenRetryDelay
 			} else {
 				RetryCfg.RetryDelayInSeconds = tokenRetryDelayInt
 			}
@@ -651,11 +489,7 @@ func main() {
 		logrus.Error("Could not create k8s client!!", err)
 	}
 
-	ecrClient := newEcrClient()
-	gcrClient := newGcrClient()
-	dprClient := newDprClient()
-	acrClient := newACRClient()
-	c := &controller{util, ecrClient, gcrClient, dprClient, acrClient}
+	c := &controller{util, getSecretGenerators}
 
 	util.WatchNamespaces(time.Duration(*argRefreshMinutes)*time.Minute, func(ns *v1.Namespace) error {
 		return handler(c, ns)

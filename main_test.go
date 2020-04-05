@@ -9,11 +9,14 @@ import (
 	"os"
 	"testing"
 
+	"github.com/flanksource/registry-creds/providers"
+
 	"github.com/Sirupsen/logrus"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ecr"
+	"github.com/flanksource/registry-creds/config"
+	"github.com/flanksource/registry-creds/k8sutil"
 	"github.com/stretchr/testify/assert"
-	"github.com/upmc-enterprises/registry-creds/k8sutil"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	coreType "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -252,28 +255,27 @@ func (f *fakeFailingGcrClient) DefaultTokenSource(ctx context.Context, scope ...
 	return nil, errors.New("fake error")
 }
 
-type fakeDprClient struct{}
-
-func (f *fakeDprClient) getAuthToken(server, user, password string) (AuthToken, error) {
-	return AuthToken{AccessToken: "fakeToken", Endpoint: "fakeEndpoint"}, nil
+type fakeProvider struct {
+	accessToken string
+	endpoint    string
 }
 
-type fakeFailingDprClient struct{}
-
-func (f *fakeFailingDprClient) getAuthToken(server, user, password string) (AuthToken, error) {
-	return AuthToken{}, errors.New("fake error")
+func (f *fakeProvider) GetAuthToken() ([]providers.AuthToken, error) {
+	return []providers.AuthToken{{AccessToken: f.accessToken, Endpoint: f.endpoint}}, nil
 }
 
-type fakeACRClient struct{}
-
-func (f *fakeACRClient) getAuthToken(registryURL, clientID, pasword string) (AuthToken, error) {
-	return AuthToken{AccessToken: "fakeACRToken", Endpoint: "fakeACREndpoint"}, nil
+func (f *fakeProvider) Enabled() bool {
+	return true
 }
 
-type fakeFailingACRClient struct{}
+type fakeFailingProvider struct{}
 
-func (f *fakeFailingACRClient) getAuthToken(registryURL, clientID, password string) (AuthToken, error) {
-	return AuthToken{}, errors.New("fake error")
+func (f *fakeFailingProvider) GetAuthToken() ([]providers.AuthToken, error) {
+	return []providers.AuthToken{}, errors.New("fake error")
+}
+
+func (f *fakeFailingProvider) Enabled() bool {
+	return true
 }
 
 func newKubeUtil() *k8sutil.K8sutilInterface {
@@ -345,36 +347,12 @@ func newFakeKubeClient() k8sutil.KubeInterface {
 	}
 }
 
-func newFakeEcrClient() *fakeEcrClient {
-	return &fakeEcrClient{}
+func newFakeProvider(accessToken, endpoint string) providers.Provider {
+	return &fakeProvider{accessToken: accessToken, endpoint: endpoint}
 }
 
-func newFakeGcrClient() *fakeGcrClient {
-	return &fakeGcrClient{}
-}
-
-func newFakeDprClient() *fakeDprClient {
-	return &fakeDprClient{}
-}
-
-func newFakeACRClient() *fakeACRClient {
-	return &fakeACRClient{}
-}
-
-func newFakeFailingGcrClient() *fakeFailingGcrClient {
-	return &fakeFailingGcrClient{}
-}
-
-func newFakeFailingEcrClient() *fakeFailingEcrClient {
-	return &fakeFailingEcrClient{}
-}
-
-func newFakeFailingDprClient() *fakeFailingDprClient {
-	return &fakeFailingDprClient{}
-}
-
-func newFakeFailingACRClient() *fakeFailingACRClient {
-	return &fakeFailingACRClient{}
+func newFakeFailingProvider() providers.Provider {
+	return &fakeFailingProvider{}
 }
 
 func process(t *testing.T, c *controller) {
@@ -387,37 +365,67 @@ func process(t *testing.T, c *controller) {
 
 func newFakeController() *controller {
 	util := newKubeUtil()
-	ecrClient := newFakeEcrClient()
-	gcrClient := newFakeGcrClient()
-	dprClient := newFakeDprClient()
-	acrClient := newFakeACRClient()
-	c := controller{util, ecrClient, gcrClient, dprClient, acrClient}
+	c := controller{util, fakeGenerators(
+		newFakeProvider("fakeGcrToken", "fakeGcrEndpoint"),
+		newFakeProvider("fakeEcrToken", "fakeEcrEndpoint"),
+		newFakeProvider("fakeDprToken", "fakeAcrEndpoint"),
+		newFakeProvider("fakeAcrToken", "fakeAcrEndpoint"),
+	)}
 	return &c
 }
 
 func newFakeFailingController() *controller {
 	util := newKubeUtil()
-	ecrClient := newFakeFailingEcrClient()
-	gcrClient := newFakeFailingGcrClient()
-	dprClient := newFakeFailingDprClient()
-	acrClient := newFakeFailingACRClient()
-	c := controller{util, ecrClient, gcrClient, dprClient, acrClient}
+	c := controller{util, fakeGenerators(newFakeFailingProvider(), newFakeFailingProvider(), newFakeFailingProvider(), newFakeFailingProvider())}
 	return &c
 }
 
-func TestGetECRAuthorizationKey(t *testing.T) {
-	awsAccountIDs = []string{"12345678", "999999"}
-	c := newFakeController()
-
-	tokens, err := c.getECRAuthorizationKey()
-
-	assert.Nil(t, err)
-	assert.Equal(t, 2, len(tokens))
-	assert.Equal(t, "fakeToken1", tokens[0].AccessToken)
-	assert.Equal(t, "fakeEndpoint1", tokens[0].Endpoint)
-	assert.Equal(t, "fakeToken2", tokens[1].AccessToken)
-	assert.Equal(t, "fakeEndpoint2", tokens[1].Endpoint)
+func fakeGenerators(gcr, ecr, dpr, acr providers.Provider) SecretGeneratorBuilder {
+	fn := func() []SecretGenerator {
+		generators := []SecretGenerator{
+			{
+				Name:       "gcr",
+				Provider:   gcr,
+				IsJSONCfg:  false,
+				SecretName: *argGCRSecretName,
+			},
+			{
+				Name:       "ecr",
+				Provider:   ecr,
+				IsJSONCfg:  true,
+				SecretName: *argAWSSecretName,
+			},
+			{
+				Name:       "dpr",
+				Provider:   dpr,
+				IsJSONCfg:  true,
+				SecretName: *argDPRSecretName,
+			},
+			{
+				Name:       "apr",
+				Provider:   acr,
+				IsJSONCfg:  true,
+				SecretName: *argACRSecretName,
+			},
+		}
+		return generators
+	}
+	return fn
 }
+
+//func TestGetECRAuthorizationKey(t *testing.T) {
+//	awsAccountIDs = []string{"12345678", "999999"}
+//	p := newFakeProvider()
+//
+//	tokens, err := p.GetAuthToken()
+//
+//	assert.Nil(t, err)
+//	assert.Equal(t, 2, len(tokens))
+//	assert.Equal(t, "fakeToken1", tokens[0].AccessToken)
+//	assert.Equal(t, "fakeEndpoint1", tokens[0].Endpoint)
+//	assert.Equal(t, "fakeToken2", tokens[1].AccessToken)
+//	assert.Equal(t, "fakeEndpoint2", tokens[1].Endpoint)
+//}
 
 func assertDockerJSONContains(t *testing.T, endpoint, token string, secret *v1.Secret) {
 	d := dockerJSON{}
@@ -450,7 +458,7 @@ func assertAllExpectedSecrets(t *testing.T, c *controller) {
 		assert.Nil(t, err)
 		assert.Equal(t, *argGCRSecretName, secret.Name)
 		assert.Equal(t, map[string][]byte{
-			".dockercfg": []byte(fmt.Sprintf(dockerCfgTemplate, "fakeEndpoint", "fakeToken")),
+			".dockercfg": []byte(fmt.Sprintf(config.DockerCfgTemplate, "fakeGcrEndpoint", "fakeGcrToken")),
 		}, secret.Data)
 		assert.Equal(t, v1.SecretType("kubernetes.io/dockercfg"), secret.Type)
 	}
@@ -463,7 +471,7 @@ func assertAllExpectedSecrets(t *testing.T, c *controller) {
 		secret, err := c.k8sutil.GetSecret(ns, *argAWSSecretName)
 		assert.Nil(t, err)
 		assert.Equal(t, *argAWSSecretName, secret.Name)
-		assertDockerJSONContains(t, "fakeEndpoint", "fakeToken", secret)
+		assertDockerJSONContains(t, "fakeEcrEndpoint", "fakeEcrToken", secret)
 		assert.Equal(t, v1.SecretType("kubernetes.io/dockerconfigjson"), secret.Type)
 	}
 
@@ -475,7 +483,7 @@ func assertAllExpectedSecrets(t *testing.T, c *controller) {
 		secret, err := c.k8sutil.GetSecret(ns, *argACRSecretName)
 		assert.Nil(t, err)
 		assert.Equal(t, *argACRSecretName, secret.Name)
-		assertDockerJSONContains(t, "fakeACREndpoint", "fakeACRToken", secret)
+		assertDockerJSONContains(t, "fakeAcrEndpoint", "fakeAcrToken", secret)
 		assert.Equal(t, v1.SecretType("kubernetes.io/dockerconfigjson"), secret.Type)
 	}
 
@@ -644,8 +652,14 @@ func TestFailingGcrPassingEcrStillSucceeds(t *testing.T) {
 	enableShortRetries()
 
 	awsAccountIDs = []string{""}
-	c := newFakeFailingController()
-	c.ecrClient = newFakeEcrClient()
+
+	util := newKubeUtil()
+	c := &controller{util, fakeGenerators(
+		newFakeFailingProvider(),
+		newFakeProvider("fakeEcrToken", "fakeEcrEndpoint"),
+		newFakeFailingProvider(),
+		newFakeFailingProvider(),
+	)}
 
 	process(t, c)
 }
@@ -654,8 +668,14 @@ func TestPassingGcrPassingEcrStillSucceeds(t *testing.T) {
 	enableShortRetries()
 
 	awsAccountIDs = []string{""}
-	c := newFakeFailingController()
-	c.gcrClient = newFakeGcrClient()
+
+	util := newKubeUtil()
+	c := &controller{util, fakeGenerators(
+		newFakeProvider("fakeGcrToken", "fakeGcrEndpoint"),
+		newFakeProvider("fakeEcrToken", "fakeEcrEndpoint"),
+		newFakeFailingProvider(),
+		newFakeFailingProvider(),
+	)}
 
 	process(t, c)
 }
