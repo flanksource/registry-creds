@@ -3,7 +3,11 @@ package providers
 import (
 	"context"
 	"fmt"
+	"os/user"
+	"path"
+	"os"
 
+	log "github.com/Sirupsen/logrus"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
@@ -48,6 +52,24 @@ func (p *GCR) GetAuthToken() ([]AuthToken, error) {
 }
 
 func (p *GCR) Enabled() bool {
+	usr, err := user.Current()
+	if err != nil {
+		log.Errorf("Failed to get current user: %v", err)
+		return false
+	}
+	filename := path.Join(usr.HomeDir, ".config", "gcloud", "application_default_credentials.json")
+
+	info, err := os.Stat(filename)
+	if err != nil && os.IsNotExist(err) {
+		return false
+	} else if err != nil {
+		log.Errorf("Failed to list %s: %v", filename, err)
+		return false
+	} else if info.IsDir() {
+		log.Errorf("File %s is a directory")
+		return false
+	}
+
 	return p.url != ""
 }
 
